@@ -1,0 +1,11 @@
+# Local development profile: loads fictional demo users and accounts.
+# Never enable this profile anywhere real credentials or data exist.
+spring:
+  datasource:
+    password: ${DB_PASSWORD:smartbanking}
+  flyway:
+    locations: classpath:db/migration,classpath:db/demo
+
+app:
+  security:
+    jwt-secret: ${JWT_SECRET:local-demo-secret-change-me-0123456789abcdef}
