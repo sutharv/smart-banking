@@ -1,10 +1,52 @@
 # Smart Banking Simulator
 
+[![CI](https://github.com/sutharv/smart-banking/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sutharv/smart-banking/actions/workflows/ci.yml)
+
 A full-stack banking simulator: customers view fictional accounts, transfer fictional money, and inspect their history; an analyst reviews suspicious-activity alerts raised by simple, explainable rules.
 
 The point of the project is to show how a reliable financial application validates requests, protects data, keeps the database consistent under concurrency, and proves all of that with automated tests.
 
 > **This is a learning simulator, not a bank.** All accounts, people and money are fictional, credentials are local demo credentials, and the fraud rules are illustrative — they are not production-grade fraud detection.
+
+## Demo
+
+A 2,500 EUR transfer goes through, the high-value rule flags it, and an analyst reviews and dismisses the alert with a note.
+
+![Demo: a transfer triggers a fraud alert, which an analyst then reviews](docs/images/demo.gif)
+
+## Screenshots
+
+| Dashboard | Transfer history |
+|---|---|
+| ![Customer dashboard with balances per account and recent activity](docs/images/dashboard.png) | ![Account history showing completed, flagged and rejected transfers](docs/images/transfer-history.png) |
+| Balances per account and currency, with recent activity and flagged transfers. | Completed, flagged and rejected transfers; a rejected attempt keeps its reason. |
+
+**Fraud-alert queue (analyst view)**
+
+![Analyst alert queue with high-value, velocity and repeated-transfer alerts](docs/images/fraud-alerts.png)
+
+Every alert names the rule that fired, its severity, and the exact numbers behind it. Analysts confirm or dismiss each alert once, with an optional note.
+
+## My contributions
+
+I designed and built the whole project: the domain model, backend, frontend, tests and delivery pipeline.
+
+- **Transfer engine.** Single-transaction transfers with ordered pessimistic row locks, a double-entry ledger, idempotency keys and recorded rejections. A concurrency test proves there's no double spending and no deadlocks.
+- **Data integrity in the database itself.** Flyway schema with `CHECK` constraints (no negative balances, valid state combinations), unique idempotency keys, and a trigger that makes ledger rows immutable.
+- **Fraud monitoring.** A pluggable `FraudRule` interface with three configurable, explainable rules, plus an analyst review workflow.
+- **Security.** Stateless JWT auth, role-based access, ownership checks in the service layer, `404` instead of `403` for other customers' accounts, RFC 9457 error responses and an audit trail.
+- **Angular frontend.** Standalone components with signals, typed API services, form validation, and idempotency-key reuse on retry.
+- **Quality and delivery.** Unit, MockMvc, Testcontainers and concurrency tests, Vitest frontend tests, GitHub Actions CI, and a one-command Docker Compose environment.
+
+| Decision | Why |
+|---|---|
+| Pessimistic locks in ascending id order | Hot accounts would cause retry storms under optimistic locking; a fixed lock order rules out A→B / B→A deadlocks. |
+| Double-entry, append-only ledger | Balances can always be reconciled (`balance = SUM(entries)`), and history can't be silently rewritten. |
+| Flag, don't block | Rules are heuristics: a flagged transfer still completes and goes to a human, so false positives don't stop customers. |
+| Record rejected attempts | Failed transfers stay auditable and visible to the sender, with a reason. |
+| Idempotency keys | Retries after network errors never move money twice. |
+
+The full reasoning is in [Key design decisions](#key-design-decisions).
 
 ## Stack
 
@@ -88,17 +130,30 @@ Integration tests are skipped automatically when Docker is unavailable; CI alway
 
 ## Architecture
 
-```
-Angular frontend        Dashboard · Accounts · Transfers · History · Alerts
-        │  typed services, bearer token, Idempotency-Key header
-        ▼
-Spring Security + REST  JWT validation · role checks · DTO validation · problem-details errors
-        ▼
-Service layer           Transfer processing · business rules · fraud evaluation · transaction boundaries
-        ▼
-Spring Data JPA         Repositories · entity mapping · row locks
-        ▼
-PostgreSQL              app_user · account · transfer · ledger_entry · fraud_alert · audit_event
+```mermaid
+flowchart TB
+    user(["Customer / Analyst<br/>(browser)"])
+
+    subgraph fe["nginx (frontend)"]
+        spa["Angular SPA<br/>Dashboard · History · Send money · Alerts"]
+    end
+
+    subgraph be["Spring Boot (backend)"]
+        sec["Spring Security<br/>JWT validation · role checks"]
+        ctl["REST controllers<br/>DTO validation · problem-details errors"]
+        svc["Services<br/>TransferService · AccountService · FraudAlertService · ReconciliationService"]
+        fraud["Fraud rules<br/>High value · Repeated · Velocity"]
+        repo["Spring Data JPA repositories<br/>row locks (SELECT … FOR UPDATE)"]
+        sec --> ctl --> svc
+        svc --> fraud
+        svc --> repo
+    end
+
+    db[("PostgreSQL 16<br/>Flyway migrations")]
+
+    user --> spa
+    spa -- "/api/* · Bearer token · Idempotency-Key" --> sec
+    repo --> db
 ```
 
 Backend packages: `controller`, `dto`, `service`, `repository`, `entity`, `fraud`, `security`, `exception`, `config`.
@@ -189,6 +244,69 @@ curl -i localhost:8080/api/transfers \
 ```
 
 ## Data model
+
+```mermaid
+erDiagram
+    app_user ||--o{ account : owns
+    app_user ||--o{ transfer : initiates
+    account ||--o{ transfer : "source of"
+    account ||--o{ transfer : "destination of"
+    account ||--o{ ledger_entry : "has entries"
+    transfer |o--o{ ledger_entry : "posts debit + credit"
+    transfer ||--o{ fraud_alert : raises
+    app_user |o--o{ fraud_alert : reviews
+    app_user |o--o{ audit_event : performs
+
+    app_user {
+        bigint id PK
+        varchar username UK
+        varchar password_hash "BCrypt"
+        varchar role "CUSTOMER | ANALYST"
+        boolean enabled
+    }
+    account {
+        bigint id PK
+        bigint owner_user_id FK
+        varchar account_reference UK
+        varchar currency "EUR | PLN | USD"
+        numeric balance "CHECK >= 0"
+        varchar status "ACTIVE | FROZEN | CLOSED"
+        bigint version "optimistic lock"
+    }
+    transfer {
+        uuid id PK
+        bigint source_account_id FK
+        bigint destination_account_id FK
+        bigint initiated_by_user_id FK
+        numeric amount "CHECK > 0"
+        varchar status "PENDING | COMPLETED | REJECTED"
+        varchar rejection_reason
+        varchar idempotency_key "unique per user"
+        varchar request_fingerprint
+    }
+    ledger_entry {
+        bigint id PK
+        uuid transfer_id FK "null for opening balance"
+        bigint account_id FK
+        numeric amount "debit < 0, credit > 0"
+        varchar entry_type "DEBIT | CREDIT | OPENING_BALANCE"
+    }
+    fraud_alert {
+        uuid id PK
+        uuid transfer_id FK
+        varchar rule_code
+        varchar explanation
+        varchar severity "LOW | MEDIUM | HIGH"
+        varchar review_status "OPEN | CONFIRMED | DISMISSED"
+        bigint reviewed_by_user_id FK
+    }
+    audit_event {
+        bigint id PK
+        bigint actor_user_id FK
+        varchar event_type
+        varchar entity_reference
+    }
+```
 
 `app_user` (username, BCrypt hash, role) · `account` (public reference, currency, balance, status, version) · `transfer` (accounts, amount, status, rejection reason, idempotency key and request fingerprint) · `ledger_entry` (immutable debit/credit) · `fraud_alert` (rule, explanation, severity, review) · `audit_event`.
 
